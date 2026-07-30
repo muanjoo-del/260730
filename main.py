@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-전국 시군구별 청소년(13~18세, 중·고등학생 나이) 인구 '수' 지도
+전국 시군구별 청소년(13~18세, 중·고등학생 나이) 인구수 - 연도별 변화 애니메이션 지도
 - 비율(%)이 아니라 실제 인구수(명)를 기준으로 색을 칠한다.
+- 연도(2015~2026)를 슬라이더로 움직이면서 지도 색이 바뀌는 애니메이션.
 - 인구 데이터: 읍·면·동 단위 → 코드 앞 5자리로 시군구 단위로 합산
 - 지도 경계: 시군구 GeoJSON
 - 지역 매칭은 이름이 아니라 '코드'로 수행 (동명이인 시군구 문제 방지)
-- 인구수와 함께, 같은 연령대의 남녀 성비도 계산해서 표에 같이 보여준다.
 """
 
 import re
@@ -19,7 +19,7 @@ import plotly.express as px
 # -----------------------------
 # 기본 설정
 # -----------------------------
-st.set_page_config(page_title="전국 청소년 인구수 지도", layout="wide")
+st.set_page_config(page_title="전국 청소년 인구수 변화 지도", layout="wide")
 
 POPULATION_URL = (
     "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
@@ -71,27 +71,21 @@ def get_age_columns(df, prefix):
 
 
 # -----------------------------
-# 시군구 단위로 청소년 인구수 + 성비 계산
+# 시군구 x 연도 단위로 청소년 인구수 + 성비 계산 (전체 연도!)
 # -----------------------------
 @st.cache_data
-def calc_teen_population(df):
+def calc_teen_population_all_years(df):
     df = df.copy()
     # 코드는 행정동(읍면동) 코드이므로, 앞 5자리를 잘라 시군구 코드로 사용
     df["시군구코드"] = df["코드"].str[:5]
 
-    # 최신 연도만 사용
-    latest_year = df["연도"].max()
-    df_latest = df[df["연도"] == latest_year].copy()
+    # 계/남/여 각각 나이별 열 찾기 (연도가 달라져도 열 이름 구조는 동일하다고 가정)
+    total_age_map = get_age_columns(df, "계")
+    male_age_map = get_age_columns(df, "남")
+    female_age_map = get_age_columns(df, "여")
 
-    # 계/남/여 각각 나이별 열 찾기
-    total_age_map = get_age_columns(df_latest, "계")
-    male_age_map = get_age_columns(df_latest, "남")
-    female_age_map = get_age_columns(df_latest, "여")
-
-    # 전체 인구를 구하기 위한 열(모든 나이) - 참고용 비율 계산에 사용
     all_total_cols = list(total_age_map.keys())
 
-    # 청소년(13~18세) 나이에 해당하는 열만 골라내기
     def teen_cols(age_map):
         return [c for c, age in age_map.items() if TEEN_MIN_AGE <= age <= TEEN_MAX_AGE]
 
@@ -99,32 +93,29 @@ def calc_teen_population(df):
     teen_male_cols = teen_cols(male_age_map)
     teen_female_cols = teen_cols(female_age_map)
 
-    # 필요한 값들을 각 행(읍면동)에 대해 계산
-    df_latest["전체인구"] = df_latest[all_total_cols].sum(axis=1)
-    df_latest["청소년인구"] = df_latest[teen_total_cols].sum(axis=1)
-    df_latest["남청소년인구"] = df_latest[teen_male_cols].sum(axis=1)
-    df_latest["여청소년인구"] = df_latest[teen_female_cols].sum(axis=1)
+    # 행(읍면동 x 연도) 단위로 값 계산
+    df["전체인구"] = df[all_total_cols].sum(axis=1)
+    df["청소년인구"] = df[teen_total_cols].sum(axis=1)
+    df["남청소년인구"] = df[teen_male_cols].sum(axis=1)
+    df["여청소년인구"] = df[teen_female_cols].sum(axis=1)
 
-    # 시군구 단위로 합산
+    # 연도 + 시군구 단위로 합산
     grouped = (
-        df_latest.groupby("시군구코드")[
+        df.groupby(["연도", "시군구코드"])[
             ["전체인구", "청소년인구", "남청소년인구", "여청소년인구"]
         ]
         .sum()
         .reset_index()
     )
 
-    # 참고용: 청소년 비율(%) - 표에서 같이 보여주기 위해 남겨둠
     grouped["청소년비율"] = (grouped["청소년인구"] / grouped["전체인구"] * 100).round(2)
-
-    # 성비: 여자 100명당 남자 수 (통계청에서 흔히 쓰는 방식)
     grouped["성비"] = np.where(
         grouped["여청소년인구"] > 0,
         (grouped["남청소년인구"] / grouped["여청소년인구"] * 100).round(1),
         np.nan,
     )
 
-    return grouped, latest_year
+    return grouped
 
 
 # -----------------------------
@@ -145,11 +136,10 @@ def geojson_to_dataframe(geojson):
 
 
 # -----------------------------
-# 색상 구간(5단계) 자동 계산: 인구'수'를 실제로 다섯 덩어리로 나눈다
+# 색상 구간(5단계) 자동 계산: 모든 연도를 합쳐서 다섯 덩어리로 나눈다
+# (연도마다 기준이 바뀌면 애니메이션에서 색 의미가 흔들리므로, 전체 기간 기준 1번만 계산)
 # -----------------------------
 def make_quantile_bins(series, n_bins=5):
-    """청소년 인구수 값을 20/40/60/80 백분위수로 잘라
-    (경계값 리스트, 구간 이름 리스트)를 돌려준다. 이름에는 천단위 콤마를 붙인다."""
     clean = series.dropna()
     quantiles = [i / n_bins for i in range(1, n_bins)]  # [0.2, 0.4, 0.6, 0.8]
     cut_points = clean.quantile(quantiles).round(0).astype(int).tolist()
@@ -157,7 +147,7 @@ def make_quantile_bins(series, n_bins=5):
     edges = [-np.inf] + cut_points + [np.inf]
 
     def fmt(n):
-        return f"{n:,}명"  # 예: 12,345명
+        return f"{n:,}명"
 
     labels = []
     for i in range(n_bins):
@@ -175,10 +165,10 @@ def make_quantile_bins(series, n_bins=5):
 # 메인 앱
 # -----------------------------
 def main():
-    st.title("🧑‍🎓 전국 시군구별 청소년 인구수 지도")
+    st.title("🧑‍🎓 전국 시군구별 청소년 인구수 변화 애니메이션 지도")
     st.caption(
-        f"중·고등학생 나이({TEEN_MIN_AGE}~{TEEN_MAX_AGE}세) 인구 '수'를 시군구 단위로 표시합니다. "
-        "(비율이 아니라 실제 인원수 기준입니다)"
+        f"중·고등학생 나이({TEEN_MIN_AGE}~{TEEN_MAX_AGE}세) 인구수가 연도에 따라 "
+        "어떻게 바뀌는지 지도에서 확인할 수 있습니다. 아래 재생▶ 버튼을 누르거나 슬라이더를 움직여 보세요."
     )
 
     # 데이터 로딩
@@ -186,38 +176,45 @@ def main():
         pop_df = load_population()
         geojson = load_geojson()
 
-    pop_teen_df, latest_year = calc_teen_population(pop_df)
+    teen_all_years = calc_teen_population_all_years(pop_df)
     geo_df = geojson_to_dataframe(geojson)
 
     # 지도용 데이터: GeoJSON의 코드를 기준으로 인구 데이터를 붙인다 (코드로 매칭!)
-    merged = geo_df.merge(pop_teen_df, left_on="코드", right_on="시군구코드", how="left")
+    # 시군구 하나당 연도 수(예: 12개)만큼 행이 여러 개 생긴다.
+    merged = geo_df.merge(teen_all_years, left_on="코드", right_on="시군구코드", how="left")
+    merged = merged.dropna(subset=["연도"]).copy()
+    merged["연도"] = merged["연도"].astype(int)
 
-    # 청소년 인구수를 5단계 구간으로 자동으로 나누기 (실제 데이터를 다섯 덩어리로 분할)
+    years_sorted = sorted(merged["연도"].unique().tolist())
+
+    # 색상 구간은 전체 연도를 합친 값을 기준으로 한 번만 계산 (애니메이션 중 기준 유지)
     bin_edges, bin_labels = make_quantile_bins(merged["청소년인구"], n_bins=5)
     merged["구간"] = pd.cut(
         merged["청소년인구"], bins=bin_edges, labels=bin_labels, right=False
     )
 
-    st.subheader(f"{latest_year}년 기준 시군구별 청소년({TEEN_MIN_AGE}~{TEEN_MAX_AGE}세) 인구수")
+    # -----------------------------
+    # 애니메이션 단계구분도
+    # -----------------------------
+    st.subheader(f"{years_sorted[0]}년 ~ {years_sorted[-1]}년 청소년({TEEN_MIN_AGE}~{TEEN_MAX_AGE}세) 인구수 변화")
 
-    # -----------------------------
-    # 단계구분도 그리기
-    # -----------------------------
     fig = px.choropleth(
         merged,
         geojson=geojson,
-        locations="코드",                # merged의 '코드' 열 값으로
-        featureidkey="properties.코드",   # geojson의 properties.코드 값과 매칭
+        locations="코드",
+        featureidkey="properties.코드",
         color="구간",
-        category_orders={"구간": bin_labels},
+        animation_frame="연도",
+        category_orders={"연도": years_sorted, "구간": bin_labels},
         color_discrete_map=dict(zip(bin_labels, BIN_COLORS)),
         hover_name="시군구",
         hover_data={
             "시도": True,
-            "청소년인구": ":,",     # 천단위 콤마 표시
+            "청소년인구": ":,",
             "성비": ":.1f",
             "청소년비율": ":.1f",
-            "코드": False,           # 코드는 마우스오버에 안 보이게
+            "연도": False,   # 슬라이더에 이미 표시되므로 hover에서는 생략
+            "코드": False,
             "구간": False,
         },
         labels={
@@ -229,11 +226,7 @@ def main():
         },
     )
 
-    # 배경 지도(타일) 없이 경계선만 보이도록 설정
-    fig.update_geos(
-        fitbounds="locations",
-        visible=False,          # 기본 세계지도 배경 숨기기
-    )
+    fig.update_geos(fitbounds="locations", visible=False)
     fig.update_traces(marker_line_color="white", marker_line_width=0.5)
     fig.update_layout(
         margin={"r": 0, "t": 10, "l": 0, "b": 0},
@@ -241,33 +234,66 @@ def main():
         height=650,
     )
 
+    # 애니메이션 프레임(재생) 속도 조절: 프레임 사이 800ms
+    if fig.layout.updatemenus:
+        fig.layout.updatemenus[0].buttons[0].args[1]["frame"]["duration"] = 800
+        fig.layout.updatemenus[0].buttons[0].args[1]["transition"]["duration"] = 300
+
     st.plotly_chart(fig, use_container_width=True)
 
     # -----------------------------
-    # 상위 10 / 하위 10 표 (청소년 인구수 + 성비 함께 표시)
+    # 특정 시군구 선택 -> 연도별 추이 선 그래프
     # -----------------------------
-    st.subheader("청소년 인구수 상위 10 / 하위 10 시군구")
+    st.subheader("특정 시군구의 연도별 청소년 인구 추이")
+
+    region_options = (
+        merged[["코드", "시도", "시군구"]]
+        .drop_duplicates()
+        .assign(표시이름=lambda d: d["시도"] + " " + d["시군구"])
+        .sort_values("표시이름")
+    )
+    selected_display = st.selectbox("시군구를 선택하세요", region_options["표시이름"].tolist())
+    selected_code = region_options.loc[
+        region_options["표시이름"] == selected_display, "코드"
+    ].values[0]
+
+    trend_df = merged[merged["코드"] == selected_code].sort_values("연도")
+
+    line_fig = px.line(
+        trend_df,
+        x="연도",
+        y="청소년인구",
+        markers=True,
+        labels={"연도": "연도", "청소년인구": "청소년 인구수(명)"},
+        title=f"{selected_display} 청소년({TEEN_MIN_AGE}~{TEEN_MAX_AGE}세) 인구 추이",
+    )
+    line_fig.update_layout(height=350, margin={"r": 20, "t": 40, "l": 20, "b": 20})
+    st.plotly_chart(line_fig, use_container_width=True)
+
+    # -----------------------------
+    # 최신 연도 기준 상위 10 / 하위 10 표
+    # -----------------------------
+    latest_year = years_sorted[-1]
+    st.subheader(f"{latest_year}년 기준 청소년 인구수 상위 10 / 하위 10 시군구")
     st.caption("성비는 '여자 청소년 100명당 남자 청소년 수'입니다. (100보다 크면 남자가 더 많음)")
 
-    table_df = merged.dropna(subset=["청소년인구"]).copy()
-    table_df["청소년인구(명)"] = table_df["청소년인구"].round(0).astype(int)
-    table_df["성비"] = table_df["성비"].round(1)
-    table_df["비율(%)"] = table_df["청소년비율"].round(1)
+    latest_df = merged[merged["연도"] == latest_year].dropna(subset=["청소년인구"]).copy()
+    latest_df["청소년인구(명)"] = latest_df["청소년인구"].round(0).astype(int)
+    latest_df["성비"] = latest_df["성비"].round(1)
+    latest_df["비율(%)"] = latest_df["청소년비율"].round(1)
 
     display_cols = ["시도", "시군구", "청소년인구(명)", "성비", "비율(%)"]
 
     top10 = (
-        table_df.sort_values("청소년인구", ascending=False)
+        latest_df.sort_values("청소년인구", ascending=False)
         .head(10)[display_cols]
         .reset_index(drop=True)
     )
     bottom10 = (
-        table_df.sort_values("청소년인구", ascending=True)
+        latest_df.sort_values("청소년인구", ascending=True)
         .head(10)[display_cols]
         .reset_index(drop=True)
     )
-
-    # 순위가 1부터 보이도록 인덱스 조정
     top10.index = top10.index + 1
     bottom10.index = bottom10.index + 1
 
